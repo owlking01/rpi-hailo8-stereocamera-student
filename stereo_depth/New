@@ -1,0 +1,299 @@
+import os
+import time
+import numpy as np
+import cv2
+
+# =========================
+# USER SETTINGS (여기만 수정)
+# =========================
+NPZ_PATH = os.path.expanduser("~/stereo_calib/stereo_calib_result.npz")
+
+# 장치 좌/우 (여기만 바꿔서 고정!)
+DEV_L = "/dev/video0"
+DEV_R = "/dev/video2"
+
+# 캡처 해상도 (겹침 때문에 1280x800 유지)
+CAP_W, CAP_H = 1280, 800
+
+# 처리/표시 해상도 (렉 줄이기)
+PROC_W, PROC_H = 640, 480  # display size too
+
+FPS = 30
+
+# ROI (처리 해상도 기준, 가운데 영역)
+ROI_X0, ROI_X1 = int(PROC_W*0.30), int(PROC_W*0.70)
+ROI_Y0, ROI_Y1 = int(PROC_H*0.55), int(PROC_H*0.80)
+
+
+# Z 안정화 (EMA)
+EMA_ALPHA = 0.2  # 0.1~0.3 추천
+# =========================
+
+
+def open_cam(dev):
+    cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        raise RuntimeError(f"Camera open failed: {dev}")
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_H)
+    cap.set(cv2.CAP_PROP_FPS, FPS)
+
+    # latency 줄이기
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+    return cap
+
+
+def to_bgr_from_grbg(frame):
+    # GRBG(bayer) -> BGR
+    if frame is None:
+        return None
+    if len(frame.shape) == 2:
+        return cv2.cvtColor(frame, cv2.COLOR_BayerGR2BGR)
+    if frame.shape[2] == 1:
+        return cv2.cvtColor(frame, cv2.COLOR_BayerGR2BGR)
+    return frame
+
+
+def load_npz(npz_path: str):
+    d = np.load(npz_path, allow_pickle=True)
+    need = ["K1", "D1", "K2", "D2", "R1", "R2", "P1", "P2", "T"]
+    keys = list(d.keys())
+    for k in need:
+        if k not in d:
+            raise RuntimeError(f"NPZ missing key: {k}\nkeys={keys}")
+    return d
+
+
+def scale_K(K, sx, sy):
+    K2 = K.copy().astype(np.float64)
+    K2[0, 0] *= sx  # fx
+    K2[1, 1] *= sy  # fy
+    K2[0, 2] *= sx  # cx
+    K2[1, 2] *= sy  # cy
+    return K2
+
+
+def scale_P(P, sx, sy):
+    P2 = P.copy().astype(np.float64)
+    P2[0, 0] *= sx  # fx
+    P2[1, 1] *= sy  # fy
+    P2[0, 2] *= sx  # cx
+    P2[1, 2] *= sy  # cy
+    # P[0,3], P[1,3]는 보통 0이거나, fx*Tx 형태인데
+    # 여기서는 fx 스케일만 맞추면 Z식(fx*baseline/disp)에 충분히 일관됨.
+    P2[0, 3] *= sx
+    P2[1, 3] *= sy
+    return P2
+
+
+def build_maps_for_proc(d):
+    # NPZ는 CAP_W x CAP_H 기준으로 캘리브된 상태라고 가정
+    # 처리 해상도(PROC)로 맵을 새로 생성해서 remap 비용을 줄임
+    sx = PROC_W / float(CAP_W)
+    sy = PROC_H / float(CAP_H)
+
+    K1 = np.array(d["K1"])
+    D1 = np.array(d["D1"]).reshape(-1, 1)
+    K2 = np.array(d["K2"])
+    D2 = np.array(d["D2"]).reshape(-1, 1)
+
+    R1 = np.array(d["R1"])
+    R2 = np.array(d["R2"])
+    P1 = np.array(d["P1"])
+    P2 = np.array(d["P2"])
+
+    K1s = scale_K(K1, sx, sy)
+    K2s = scale_K(K2, sx, sy)
+    P1s = scale_P(P1, sx, sy)
+    P2s = scale_P(P2, sx, sy)
+
+    size = (PROC_W, PROC_H)
+    map1x, map1y = cv2.initUndistortRectifyMap(K1s, D1, R1, P1s, size, cv2.CV_16SC2)
+    map2x, map2y = cv2.initUndistortRectifyMap(K2s, D2, R2, P2s, size, cv2.CV_16SC2)
+
+    fx_proc = float(P1s[0, 0])
+    return map1x, map1y, map2x, map2y, fx_proc
+
+
+def build_metric(d):
+    # ✅✅ 결론: T는 이미 meters
+    T = np.array(d["T"]).reshape(3)
+    baseline_m = float(np.linalg.norm(T))
+
+    # circle_spacing은 참고 출력만 (baseline에 절대 곱하지 않음)
+    cs = None
+    if "circle_spacing" in d:
+        cs = float(np.array(d["circle_spacing"]).reshape(()))
+
+    return baseline_m, cs
+
+
+def main():
+    d = load_npz(NPZ_PATH)
+
+    baseline_m, circle_spacing = build_metric(d)
+
+    mapLx, mapLy, mapRx, mapRy, fx = build_maps_for_proc(d)
+
+    print("Loading NPZ:", NPZ_PATH)
+    if circle_spacing is not None:
+        print(f"[metric] circle_spacing={circle_spacing:.6f} (NOTE: not used for baseline)")
+    print(f"[metric] baseline={baseline_m:.4f} m  (THIS is ||T||)")
+    print(f"[metric] fx(PROC)={fx:.2f} px  (scaled to {PROC_W}x{PROC_H})")
+    print(f"[perf] CAP={CAP_W}x{CAP_H}  PROC={PROC_W}x{PROC_H}")
+    print("Keys: [q] quit | [s] save snapshot")
+
+    capL = open_cam(DEV_L)
+    capR = open_cam(DEV_R)
+
+    # SGBM (가볍게 시작)
+    min_disp = 0
+    num_disp = 16 * 6  # 96 (가벼움)
+    block = 5
+
+    sgbm = cv2.StereoSGBM_create(
+        minDisparity=min_disp,
+        numDisparities=num_disp,
+        blockSize=block,
+        P1=8 * 1 * block * block,
+        P2=32 * 1 * block * block,
+        disp12MaxDiff=1,
+        uniquenessRatio=8,
+        speckleWindowSize=80,
+        speckleRange=2,
+        preFilterCap=31,
+        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+    )
+
+    WIN = "Stereo Rectified + Disparity"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, PROC_W, PROC_H)
+
+    z_ema = None
+    last_t = time.time()
+    frames = 0
+    fps_text = 0.0
+
+    out_dir = os.path.expanduser("~/stereo_calib")
+    os.makedirs(out_dir, exist_ok=True)
+
+    while True:
+        retL, rawL = capL.read()
+        retR, rawR = capR.read()
+        if not retL or not retR:
+            time.sleep(0.01)
+            continue
+
+        bgrL = to_bgr_from_grbg(rawL)
+        bgrR = to_bgr_from_grbg(rawR)
+
+        # CAP -> PROC resize 먼저 (속도 위해)
+        bgrL = cv2.resize(bgrL, (PROC_W, PROC_H), interpolation=cv2.INTER_AREA)
+        bgrR = cv2.resize(bgrR, (PROC_W, PROC_H), interpolation=cv2.INTER_AREA)
+
+        # rectify on PROC
+        rectL = cv2.remap(bgrL, mapLx, mapLy, cv2.INTER_LINEAR)
+        rectR = cv2.remap(bgrR, mapRx, mapRy, cv2.INTER_LINEAR)
+
+        gL = cv2.cvtColor(rectL, cv2.COLOR_BGR2GRAY)
+        gR = cv2.cvtColor(rectR, cv2.COLOR_BGR2GRAY)
+
+        disp = sgbm.compute(gL, gR).astype(np.float32) / 16.0
+        disp[disp < 0] = 0
+
+        # ROI disparity (valid mask + median)
+        roi = disp[ROI_Y0:ROI_Y1, ROI_X0:ROI_X1]
+        valid = (roi > 1.0) & (roi < (num_disp - 1)) & np.isfinite(roi)
+
+        if np.count_nonzero(valid) > 80:
+            d_med = float(np.median(roi[valid]))
+            z_now = (fx * baseline_m) / max(d_med, 1e-6)
+
+            if z_ema is None:
+                z_ema = z_now
+            else:
+                z_ema = (1.0 - EMA_ALPHA) * z_ema + EMA_ALPHA * z_now
+        else:
+            d_med = float("nan")
+            z_now = float("nan")
+            # z_ema는 유지 (갑자기 inf로 튀지 않게)
+
+        # disparity viz
+        disp_vis = cv2.normalize(disp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        disp_color = cv2.applyColorMap(disp_vis, cv2.COLORMAP_JET)
+
+        # 위: rectified side-by-side / 아래: disparity
+        top = np.hstack([rectL, rectR])
+        bot = disp_color
+                # bot: disparity 1개만 보여주되, top(=2*PROC_W)와 폭 맞추기 위해 패딩
+        bot = np.zeros((PROC_H, 2*PROC_W, 3), dtype=np.uint8)
+        x0 = (2*PROC_W - PROC_W)//2  # 가운데 정렬
+        bot[:, x0:x0+PROC_W] = disp_color
+
+
+        # 가이드라인
+        for y in range(40, PROC_H, 80):
+            cv2.line(top, (0, y), (top.shape[1]-1, y), (0, 255, 0), 1)
+
+        # ROI 박스 (top/disp 모두 표시)
+        #cv2.rectangle(top, (ROI_X0, ROI_Y0), (ROI_X1, ROI_Y1), (255, 255, 255), 1)
+
+        preview = np.vstack([top, bot])
+        # ROI box on TOP
+        # ROI box on TOP (좌우 2장 중 '왼쪽 rectL' 기준이면 그대로)
+        #cv2.rectangle(preview, (ROI_X0, ROI_Y0), (ROI_X1, ROI_Y1), (255,255,255), 1)
+
+        # ROI box on BOT (disparity는 가운데 패딩된 위치에 있음)
+        cv2.rectangle(preview,
+                      (ROI_X0 + x0, ROI_Y0 + PROC_H),
+                      (ROI_X1 + x0, ROI_Y1 + PROC_H),
+                      (255,255,255), 1)
+
+
+
+        # FPS 계산
+        frames += 1
+        now = time.time()
+        if now - last_t >= 1.0:
+            fps_text = frames / (now - last_t)
+            frames = 0
+            last_t = now
+
+        # 텍스트
+        cv2.putText(preview, f"FPS: {fps_text:.1f}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.putText(preview, f"disp_median(ROI): {d_med:.2f}px", (10, preview.shape[0]-35),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        if z_ema is not None:
+            cv2.putText(preview, f"Z_est(EMA): {z_ema:.2f} m", (10, preview.shape[0]-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        else:
+            cv2.putText(preview, "Z_est(EMA): --", (10, preview.shape[0]-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.imshow(WIN, preview)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q'):
+            break
+        if key == ord('s'):
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            cv2.imwrite(os.path.join(out_dir, f"rectL_{ts}.png"), rectL)
+            cv2.imwrite(os.path.join(out_dir, f"rectR_{ts}.png"), rectR)
+            cv2.imwrite(os.path.join(out_dir, f"disp_{ts}.png"), disp_color)
+            cv2.imwrite(os.path.join(out_dir, f"preview_{ts}.png"), preview)
+            print("Saved snapshot:", ts)
+
+    capL.release()
+    capR.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
